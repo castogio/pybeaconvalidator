@@ -70,6 +70,7 @@ class AccessPoint:
     mac: str
     model: str
     bssids: dict[str, BSSID]
+    tags: list[str]
 
     @staticmethod
     def from_dict(ap_data: dict[str, Any]) -> 'BSSID':
@@ -79,16 +80,68 @@ class AccessPoint:
             name=ap_data['name'],
             mac=ap_data['mac'],
             model=ap_data['model'],
-            bssids={ bssid['bssid']: BSSID.from_dict(bssid) for bssid in ap_data.get('basicServiceSets', []) }
+            bssids={ bssid['bssid']: BSSID.from_dict(bssid) for bssid in ap_data.get('basicServiceSets', []) },
+            tags=ap_data['tags']
         )
 
 
+@dataclass(frozen=True)
+class SSIDConfig:
+    name: str
+    number: int
+    is_enabled: bool
+    auth_mode: str
+    encryption_mode: str | None
+    wpa_type: str | None
+    minimum_bitrate: int
+    is_visible: bool
+    all_aps: bool
+    availability_tags: list[str] | None = None
+
+    @staticmethod
+    def from_dict(ssid_data: dict[str, Any]) -> 'SSIDConfig':
+
+        return SSIDConfig(
+            number=ssid_data['number'],
+            name=ssid_data['name'],
+            is_enabled=ssid_data['enabled'],
+            auth_mode=ssid_data['authMode'],
+            encryption_mode=ssid_data.get('encryptionMode', None),
+            wpa_type=ssid_data.get('wpaEncryptionMode', None),
+            minimum_bitrate=ssid_data['minBitrate'],
+            is_visible=ssid_data['visible'],
+            all_aps=ssid_data['availableOnAllAps'],
+            availability_tags=ssid_data['availabilityTags']
+        )
+
 class WirelessNetwork:
 
-    def __init__(self, access_points: Iterable[AccessPoint] = None) -> None:
+    def __init__(self,
+        access_points: Iterable[AccessPoint] = None,
+        ssids: list[SSIDConfig] = None) -> None:
         self._nodes = dict()
+        self.ssids = ssids if ssids is not None else []
         if access_points is not None:
             self.add_nodes(access_points)
+
+    @property
+    def access_points(self) -> dict[str, AccessPoint]:
+        return self._nodes
+
+    @property
+    def ssids(self) -> list[SSIDConfig]:
+        return self._ssids
+
+    @ssids.setter
+    def ssids(self, configs: list[SSIDConfig]) -> None:
+        if not isinstance(configs, list):
+            raise TypeError(f'expected a list of SSIDConfig, got a {type(configs).__name__!r}')
+        if len(configs) > 15:
+            raise TypeError(f'Cisco Meraki APs broadcast max 15 SSIDs, given a {len(configs)}')
+        if any(not isinstance(c, SSIDConfig) for c in configs):
+            raise TypeError('expected a list of SSIDConfig')
+        self._ssids = configs
+        
 
     def __iter__(self) -> Iterator[tuple[str, AccessPoint]]:
         return iter(self._nodes.items())
@@ -109,9 +162,11 @@ class WirelessNetwork:
         return result
     
     @staticmethod
-    def from_raw_data(raw_data: Iterable[dict[str, Any]]) -> 'WirelessNetwork':
-        access_points = ( AccessPoint.from_dict(access_point_data) for access_point_data in raw_data )
-        return WirelessNetwork(access_points)
+    def from_raw_data(ap_raw_data: Iterable[dict[str, Any]],
+                      ssid_raw_data: Iterable[dict[str, Any]] = None) -> 'WirelessNetwork':
+        access_points = [ AccessPoint.from_dict(access_point_data) for access_point_data in ap_raw_data ]
+        ssid_config = [ SSIDConfig.from_dict(ssid_data) for ssid_data in ssid_raw_data ]
+        return WirelessNetwork(access_points, ssid_config)
 
 
 class CustomDashboardAPI(DashboardAPI):
@@ -122,6 +177,15 @@ class CustomDashboardAPI(DashboardAPI):
             serial = node['serial']
             node |= self.wireless.getDeviceWirelessStatus(serial) # merge dicts
         return devices
+
+    def get_ssid_information_by_network(self, net_id: str) -> dict[str, Any]:
+        return self.wireless.getNetworkWirelessSsids(net_id)
+
+    def get_wireless_network(self, net_id: str) -> WirelessNetwork:
+        ap_details_collection = self.get_access_points_details_by_network(net_id)
+        ssid_details = self.get_ssid_information_by_network(net_id)
+        return WirelessNetwork.from_raw_data(ap_details_collection, ssid_details)
+   
 
 
 def filter_wlan_frames(capture):
@@ -155,10 +219,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
 
-    NETWORK_ID = args.network_id # 'N_662029145223478556'
     dashboard = CustomDashboardAPI(inherit_logging_config=True)
-    ap_details_collection = dashboard.get_access_points_details_by_network(NETWORK_ID)
-    network = WirelessNetwork.from_raw_data(ap_details_collection)
+    network = dashboard.get_wireless_network(args.network_id)
     bssid_table = network.get_bssid_lookup_table()
 
     tshark_filter = 'wlan.fc.type_subtype == 0x8'
@@ -173,14 +235,16 @@ if __name__ == '__main__':
             frame_data = dict()
             ap = bssid_table[transmitted_addr]
             frame_data['bssid'] = transmitted_addr
-            frame_data['ssid'] = ap.bssids[transmitted_addr].ssid_name
+            # frame_data['ssid'] = ap.bssids[transmitted_addr].ssid_name
             frame_data['ap_sn'] = ap.serial
-            frame_data['ap_name'] = ap.bssids[transmitted_addr].ssid_name
-            frame_data['ap_model'] = ap.model
-            frame_data['band'] = ap.bssids[transmitted_addr].band
+            # frame_data['ap_name'] = ap.bssids[transmitted_addr].ssid_name
+            # frame_data['ap_model'] = ap.model
+            # frame_data['band'] = ap.bssids[transmitted_addr].band
             frame_data['channel'] = channel
             knwon_beacons.append(frame_data)
             seen_bssid.add(transmitted_addr)
     
     pp(knwon_beacons)
+    pp(network.access_points)
+
 
