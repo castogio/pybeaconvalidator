@@ -39,7 +39,7 @@ __maintainer__ = "developer"
 __version__ = "0.0.1"
 
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.ERROR)
 
 
 @dataclass(frozen=True)
@@ -185,18 +185,36 @@ class CustomDashboardAPI(DashboardAPI):
         ap_details_collection = self.get_access_points_details_by_network(net_id)
         ssid_details = self.get_ssid_information_by_network(net_id)
         return WirelessNetwork.from_raw_data(ap_details_collection, ssid_details)
-   
 
 
-def filter_wlan_frames(capture):
+def _filter_wlan_pcap_frames(capture):
     try:
         for frame in capture:
             if not hasattr(frame, 'wlan'):
                 continue
             yield frame
-    except TSharkCrashException:
+    except TSharkCrashException as e:
         # this exception happens only if the capture was cut short
-        pass
+        print('frame was cut off mid capture -- ignoring')
+
+
+@dataclass(frozen=True)
+class BeaconFrame:
+    ta_bssid: str
+    channel: int
+
+
+def get_beacon_information_from_pcap(capture_path: str) -> dict[str,list[BeaconFrame]]:
+    BEACON_TSHARK_FITLER = 'wlan.fc.type_subtype == 0x8'
+    capture = FileCapture(capture_path, display_filter=BEACON_TSHARK_FITLER, use_json=True, include_raw=False)
+    beacons = dict()
+    for frame in _filter_wlan_pcap_frames(capture):
+        beacon_frame = BeaconFrame(
+            ta_bssid=frame.wlan.ta,
+            channel=frame.wlan_radio.channel
+        )
+        beacons.setdefault(beacon_frame.ta_bssid, []).append(beacon_frame)
+    return beacons
 
 
 if __name__ == '__main__':
@@ -223,28 +241,32 @@ if __name__ == '__main__':
     network = dashboard.get_wireless_network(args.network_id)
     bssid_table = network.get_bssid_lookup_table()
 
-    tshark_filter = 'wlan.fc.type_subtype == 0x8'
-    capture = FileCapture(args.packet_capture_file, display_filter=tshark_filter, use_json=True, include_raw=False)
 
-    knwon_beacons = list()
-    seen_bssid = set()
-    for frame in filter_wlan_frames(capture):
-        transmitted_addr = frame.wlan.ta
-        channel = frame.wlan_radio.channel
-        if transmitted_addr not in seen_bssid and  transmitted_addr in bssid_table:
-            frame_data = dict()
-            ap = bssid_table[transmitted_addr]
-            frame_data['bssid'] = transmitted_addr
-            # frame_data['ssid'] = ap.bssids[transmitted_addr].ssid_name
-            frame_data['ap_sn'] = ap.serial
-            # frame_data['ap_name'] = ap.bssids[transmitted_addr].ssid_name
-            # frame_data['ap_model'] = ap.model
-            # frame_data['band'] = ap.bssids[transmitted_addr].band
-            frame_data['channel'] = channel
-            knwon_beacons.append(frame_data)
-            seen_bssid.add(transmitted_addr)
+    seen_beacons = get_beacon_information_from_pcap(args.packet_capture_file)
+    pp(seen_beacons)
+
+    # tshark_filter = 'wlan.fc.type_subtype == 0x8'
+    # capture = FileCapture(args.packet_capture_file, display_filter=tshark_filter, use_json=True, include_raw=False)
+
+    # knwon_beacons = list()
+    # seen_bssid = set()
+    # for frame in _filter_wlan_pcap_frames(capture):
+    #     transmitted_addr = frame.wlan.ta
+    #     channel = frame.wlan_radio.channel
+    #     if transmitted_addr not in seen_bssid and  transmitted_addr in bssid_table:
+    #         frame_data = dict()
+    #         ap = bssid_table[transmitted_addr]
+    #         frame_data['bssid'] = transmitted_addr
+    #         # frame_data['ssid'] = ap.bssids[transmitted_addr].ssid_name
+    #         frame_data['ap_sn'] = ap.serial
+    #         # frame_data['ap_name'] = ap.bssids[transmitted_addr].ssid_name
+    #         # frame_data['ap_model'] = ap.model
+    #         # frame_data['band'] = ap.bssids[transmitted_addr].band
+    #         frame_data['channel'] = channel
+    #         knwon_beacons.append(frame_data)
+    #         seen_bssid.add(transmitted_addr)
     
-    pp(knwon_beacons)
-    pp(network.access_points)
+    # pp(knwon_beacons)
+    # pp(network.access_points)
 
 

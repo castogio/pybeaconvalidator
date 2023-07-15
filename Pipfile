@@ -8,6 +8,7 @@ meraki = "*"
 requests = "*"
 charset-normalizer = "*"
 pyshark = "*"
+pypacker = "*"
 
 [dev-packages]
 
