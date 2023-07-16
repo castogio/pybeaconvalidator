@@ -205,7 +205,14 @@ def _process_pypacker_frame_headers(radiotap_header: radiotap.Radiotap,
     # supported bitrates
     supported_bitrates = []
     for b in beacon_header.params[1].body_bytes:
+
+        # check if the bitrate value refers to a BASIC bitrate by checking the
+        # first bit of the octect e.g. 1000 0000 --> Basic Bitrate
         is_mandatory = bool(b >> 7)
+
+        # compute bitrate in Mbps by multiplying octect
+        # remove if 1st bit in case of mandatory bitrate
+        # bitrate = (octect * 500 kbps) // 1000
         bitrate = ((b - (1 << 7)) if is_mandatory else b) // 2
         supported_bitrates.append((is_mandatory, bitrate,))
 
@@ -223,10 +230,10 @@ def get_beacon_information_from_pcap(capture_file_path: str) -> Iterable[BeaconF
         beacons = list()
         for ts_ns, buf in capture_reader:
             frame = radiotap.Radiotap(buf)
-            radiotap_header, dot11_header, beacon_header = frame[None, ieee80211.IEEE80211, ieee80211.IEEE80211.Beacon]
-            if beacon_header is None:
+            radiotap_header, dot11_header, beacon_payload = frame[None, ieee80211.IEEE80211, ieee80211.IEEE80211.Beacon]
+            if beacon_payload is None:
                 continue
-            beacon_frame = _process_pypacker_frame_headers(radiotap_header, dot11_header, beacon_header, ts_ns)
+            beacon_frame = _process_pypacker_frame_headers(radiotap_header, dot11_header, beacon_payload, ts_ns)
             beacons.append(beacon_frame)
     return beacons
 
