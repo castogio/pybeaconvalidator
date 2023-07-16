@@ -23,10 +23,11 @@ import argparse
 from pprint import pp
 from typing import Iterable, Any, Iterator
 from dataclasses import dataclass
+from datetime import datetime
 
 from meraki import DashboardAPI
-from pyshark import FileCapture
-from pyshark.capture.capture import TSharkCrashException
+from pypacker import ppcap
+from pypacker.layer12 import radiotap, ieee80211
 
 
 __author__ = "Gioacchino Castorio"
@@ -37,9 +38,6 @@ __deprecated__ = False
 __license__ = "GPLv3"
 __maintainer__ = "developer"
 __version__ = "0.0.1"
-
-
-logging.basicConfig(level=logging.ERROR)
 
 
 @dataclass(frozen=True)
@@ -187,34 +185,83 @@ class CustomDashboardAPI(DashboardAPI):
         return WirelessNetwork.from_raw_data(ap_details_collection, ssid_details)
 
 
-def _filter_wlan_pcap_frames(capture):
-    try:
-        for frame in capture:
-            if not hasattr(frame, 'wlan'):
+@dataclass(frozen=True)
+class BeaconFrame:
+    timestamp: int
+    ta_bssid: str
+    channel: int
+    ssid: str
+    supported_bitrates: list[int]
+
+
+def _process_pypacker_frame_headers(radiotap_header: radiotap.Radiotap,
+                           dot11_header: ieee80211.IEEE80211,
+                           beacon_header: ieee80211.IEEE80211.Beacon,
+                           epoch_nsec_ts: int = 0) -> BeaconFrame:
+
+    channel_freq_mhz, _ = radiotap.get_channelinfo(radiotap_header.channel)
+    channel_number = radiotap.freq_to_channel(channel_freq_mhz * 1e6)
+
+    # supported bitrates
+    supported_bitrates = []
+    for b in beacon_header.params[1].body_bytes:
+        is_mandatory = bool(b >> 7)
+        bitrate = ((b - (1 << 7)) if is_mandatory else b) // 2
+        supported_bitrates.append((is_mandatory, bitrate,))
+
+    return BeaconFrame(
+        timestamp=epoch_nsec_ts,
+        ta_bssid=beacon_header.src_s.casefold(),
+        channel=channel_number,
+        ssid=beacon_header.essid.decode(),
+        supported_bitrates=supported_bitrates
+    )
+  
+
+def get_beacon_information_from_pcap(capture_file_path: str) -> Iterable[BeaconFrame]:
+    with ppcap.Reader(capture_file_path) as capture_reader:
+        beacons = list()
+        for ts_ns, buf in capture_reader:
+            frame = radiotap.Radiotap(buf)
+            radiotap_header, dot11_header, beacon_header = frame[None, ieee80211.IEEE80211, ieee80211.IEEE80211.Beacon]
+            if beacon_header is None:
                 continue
-            yield frame
-    except TSharkCrashException as e:
-        # this exception happens only if the capture was cut short
-        print('frame was cut off mid capture -- ignoring')
+            beacon_frame = _process_pypacker_frame_headers(radiotap_header, dot11_header, beacon_header, ts_ns)
+            beacons.append(beacon_frame)
+    return beacons
 
 
 @dataclass(frozen=True)
-class BeaconFrame:
-    ta_bssid: str
-    channel: int
+class StatusPair:
+    name: str
+    expected: Any
+    actual: Any
+
+    @property
+    def are_matching(self) -> bool:
+        return self.expected == self.actual
 
 
-def get_beacon_information_from_pcap(capture_path: str) -> dict[str,list[BeaconFrame]]:
-    BEACON_TSHARK_FITLER = 'wlan.fc.type_subtype == 0x8'
-    capture = FileCapture(capture_path, display_filter=BEACON_TSHARK_FITLER, use_json=True, include_raw=False)
-    beacons = dict()
-    for frame in _filter_wlan_pcap_frames(capture):
-        beacon_frame = BeaconFrame(
-            ta_bssid=frame.wlan.ta,
-            channel=frame.wlan_radio.channel
-        )
-        beacons.setdefault(beacon_frame.ta_bssid, []).append(beacon_frame)
-    return beacons
+def _get_compare_fields(access_point: AccessPoint, ssid_config: SSIDConfig, frame: BeaconFrame) -> set[StatusPair]:
+    field_set = set()
+    field_set.add(StatusPair('ssid name', expected=ssid_config.name, actual=frame.ssid))
+    field_set.add(StatusPair('minimum bitrate', ssid_config.minimum_bitrate, frame.supported_bitrates[0][1]))
+    return field_set
+
+
+def compare(network: WirelessNetwork, beacons: Iterable[BeaconFrame]) -> Iterable[tuple[int, str, str, set[StatusPair]]]:
+    bssid_table = network.get_bssid_lookup_table()
+    result = list()
+    for bc in beacons:
+        ap = bssid_table.get(bc.ta_bssid, None)
+        if ap is None:
+            result.append((bc.timestamp, bc.ta_bssid, None, set(),))
+        else:
+            ssid_number = ap.bssids[bc.ta_bssid].ssid_number
+            ssid_cfg = network.ssids[ssid_number]
+            field_set = _get_compare_fields(ap, ssid_cfg, bc)
+            result.append((bc.timestamp, bc.ta_bssid, ap.serial, field_set,))
+    return result
 
 
 if __name__ == '__main__':
@@ -227,46 +274,44 @@ if __name__ == '__main__':
                     epilog='''This software is distributed as GNU GPLv3 free software.\n
                             Copyright 2023, Gioacchino Castorio''')
     parser.add_argument('packet_capture_file',
-                        metavar='PCAP', 
+                        metavar='PCAP',
                         type=str,
                         help='path to the .pcap/.pcapng with the beacon frames to validate')
     parser.add_argument('--network', '-n',
                         dest='network_id',
                         required=True,
                         help='ID of the Cisco Meraki network')
+    parser.add_argument('--debug-no-dash',
+                        dest='debug_no_dashboard',
+                        action='store_false',
+                        help='if enabled, the program does not connect to the Cisco Meraki API')
     args = parser.parse_args()
 
 
+    # setup
+    logging.basicConfig(level=logging.WARNING)
     dashboard = CustomDashboardAPI(inherit_logging_config=True)
-    network = dashboard.get_wireless_network(args.network_id)
-    bssid_table = network.get_bssid_lookup_table()
 
+    print('requesting API data')
+    wireless_network = dashboard.get_wireless_network(args.network_id)
 
+    print('START reading beacond')
     seen_beacons = get_beacon_information_from_pcap(args.packet_capture_file)
-    pp(seen_beacons)
+    print('FINISH reading beacond')
 
-    # tshark_filter = 'wlan.fc.type_subtype == 0x8'
-    # capture = FileCapture(args.packet_capture_file, display_filter=tshark_filter, use_json=True, include_raw=False)
-
-    # knwon_beacons = list()
-    # seen_bssid = set()
-    # for frame in _filter_wlan_pcap_frames(capture):
-    #     transmitted_addr = frame.wlan.ta
-    #     channel = frame.wlan_radio.channel
-    #     if transmitted_addr not in seen_bssid and  transmitted_addr in bssid_table:
-    #         frame_data = dict()
-    #         ap = bssid_table[transmitted_addr]
-    #         frame_data['bssid'] = transmitted_addr
-    #         # frame_data['ssid'] = ap.bssids[transmitted_addr].ssid_name
-    #         frame_data['ap_sn'] = ap.serial
-    #         # frame_data['ap_name'] = ap.bssids[transmitted_addr].ssid_name
-    #         # frame_data['ap_model'] = ap.model
-    #         # frame_data['band'] = ap.bssids[transmitted_addr].band
-    #         frame_data['channel'] = channel
-    #         knwon_beacons.append(frame_data)
-    #         seen_bssid.add(transmitted_addr)
+    comparisons = compare(wireless_network, seen_beacons)
     
-    # pp(knwon_beacons)
-    # pp(network.access_points)
-
+    for c in comparisons:
+        ts = c[0]
+        bssid = c[1]
+        serial = c[2]
+        pairs = c[3]
+        if serial is None:
+            logging.info('unknown AP (BSSID %r) seen beaconing at %r', bssid, ts)
+            continue
+        for stat in pairs:
+            if stat.are_matching:
+                logging.info('ts %s, sn %r, bssid %r, matching %r (seen: %r)', ts, serial, bssid, stat.name, stat.actual)
+            else:
+                logging.warning('ts %s, sn %r, bssid %r, mismatch %r (expected: %r, seen: %r)', ts, serial, bssid, stat.name, stat.expected, stat.actual)
 
